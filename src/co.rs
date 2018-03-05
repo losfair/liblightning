@@ -1,4 +1,4 @@
-use platform;
+use stack::Stack;
 
 use std::os::raw;
 use std::any::Any;
@@ -24,26 +24,27 @@ enum RunningState {
     Terminated
 }
 
+/// The state of a coroutine.
+///
+/// Must not be accessed by the coroutine itself.
 pub struct CoState<F: FnOnce(&mut Yieldable)> {
-    stack: *mut [u8],
+    _stack: Option<Stack>,
     rsp: usize,
-    inside: bool,
     yield_val: Option<*const Any>,
     error_val: Option<Box<Any + Send>>,
     running_state: RunningState,
     f: Option<F>
 }
 
+/// A coroutine's view of itself.
+///
+/// Only accessible from inside a coroutine.
 pub trait Yieldable {
     fn yield_now(&mut self, val: &Any);
 }
 
 impl<F: FnOnce(&mut Yieldable)> Yieldable for CoState<F> {
     fn yield_now(&mut self, val: &Any) {
-        if !self.inside {
-            panic!("Yielding out from a coroutine outside itself");
-        }
-        self.inside = false;
         unsafe {
             self.yield_val = Some(val as *const Any);
 
@@ -54,23 +55,12 @@ impl<F: FnOnce(&mut Yieldable)> Yieldable for CoState<F> {
 }
 
 impl<F: FnOnce(&mut Yieldable)> CoState<F> {
-    pub fn new(stack_size: usize, f: F) -> CoState<F> {
-        let stack = platform::setup_stack(stack_size + *platform::PAGE_SIZE);
-        unsafe {
-            platform::setup_stack_guard_page(stack);
-        }
-
-        // The actual stack size may be greater than the requested size
-        // So we use the actual size here.
-        let rsp: usize = {
-            let stack = unsafe { &mut *stack };
-            &mut stack[0] as *mut u8 as usize + stack.len()
-        };
+    pub fn new(stack: Stack, f: F) -> CoState<F> {
+        let rsp: usize = stack.initial_rsp();
 
         CoState {
-            stack: stack,
+            _stack: Some(stack),
             rsp: rsp,
-            inside: false,
             yield_val: None,
             error_val: None,
             running_state: RunningState::NotStarted,
@@ -89,19 +79,17 @@ impl<F: FnOnce(&mut Yieldable)> CoState<F> {
 
         // No droppable objects should remain at this point.
         // Otherwise there will be a resource leak.
-        this.terminate();
+        unsafe {
+            this.terminate_from_inside();
+        }
     }
 
     pub fn resume<'a>(&'a mut self) -> Option<&'a Any> {
-        if self.inside {
-            panic!("Entering a CoState within itself");
-        }
         unsafe {
             let new_rsp = self.rsp;
 
             match self.running_state {
                 RunningState::NotStarted => {
-                    self.inside = true;
                     self.running_state = RunningState::Running;
                     let rsp = &mut self.rsp as *mut usize;
                     let self_raw = self as *mut Self as *mut raw::c_void;
@@ -114,7 +102,6 @@ impl<F: FnOnce(&mut Yieldable)> CoState<F> {
                     self.yield_val.take().map(|v| &*v)
                 },
                 RunningState::Running => {
-                    self.inside = true;
                     __ll_co_yield_now(&mut self.rsp, new_rsp);
 
                     if let Some(e) = self.error_val.take() {
@@ -128,41 +115,34 @@ impl<F: FnOnce(&mut Yieldable)> CoState<F> {
         }
     }
 
-    fn terminate(&mut self) -> ! {
-        if !self.inside {
-            panic!("[yield_terminate] Yielding out from a coroutine outside itself");
-        }
-        self.inside = false;
-
+    unsafe fn terminate_from_inside(&mut self) -> ! {
         self.running_state = RunningState::Terminated;
 
-        unsafe {
-            self.yield_val = None;
+        self.yield_val = None;
 
-            let new_rsp = self.rsp;
-            __ll_co_yield_now(&mut self.rsp, new_rsp);
-        }
+        let new_rsp = self.rsp;
+        __ll_co_yield_now(&mut self.rsp, new_rsp);
 
         eprintln!("Coroutine termination failed");
         ::std::process::abort();
     }
 
-    
+    fn ensure_terminated(&self) {
+        if self.running_state != RunningState::Terminated {
+            panic!("The current coroutine is required to be terminated at this point");
+        }
+    }
+
+    pub fn take_stack(&mut self) -> Option<Stack> {
+        // We can only safely take the stack of an already terminated coroutine.
+        self.ensure_terminated();
+        self._stack.take()
+    }
 }
 
 impl<F: FnOnce(&mut Yieldable)> Drop for CoState<F> {
     fn drop(&mut self) {
-        if self.inside {
-            eprintln!("CoState dropped before leaving");
-            ::std::process::abort();
-        }
-        // This will only cause a resource leak, which is considered "safe"
-        if self.running_state != RunningState::Terminated {
-            panic!("Coroutine dropped before termination");
-        }
-        unsafe {
-            platform::free_stack(self.stack);
-        }
+        self.ensure_terminated();
     }
 }
 
@@ -171,7 +151,7 @@ mod tests {
     use super::*;
     #[test]
     fn yield_should_work() {
-        let mut co = CoState::new(4096, |c| {
+        let mut co = CoState::new(Stack::new(4096), |c| {
             c.yield_now(&42i32 as &Any);
         });
 
@@ -181,8 +161,8 @@ mod tests {
 
     #[test]
     fn nested_should_work() {
-        let mut co = CoState::new(4096, |c| {
-            let mut co = CoState::new(4096, |c| {
+        let mut co = CoState::new(Stack::new(4096), |c| {
+            let mut co = CoState::new(Stack::new(4096), |c| {
                 c.yield_now(&42i32 as &Any);
             });
             let v = *co.resume().unwrap().downcast_ref::<i32>().unwrap() + 1;
@@ -197,7 +177,7 @@ mod tests {
     #[test]
     fn panics_should_propagate() {
         // Use a larger stack size here to make backtrace work
-        let mut co = CoState::new(16384, |_| {
+        let mut co = CoState::new(Stack::new(16384), |_| {
             panic!("Test panic");
         });
         let e = catch_unwind(AssertUnwindSafe(|| {
@@ -209,13 +189,13 @@ mod tests {
 
     #[test]
     fn instant_termination_should_work() {
-        let mut co = CoState::new(4096, |_| {});
+        let mut co = CoState::new(Stack::new(4096), |_| {});
         assert!(co.resume().is_none());
     }
 
     #[test]
     fn resume_terminated_should_return_none() {
-        let mut co = CoState::new(4096, |_| {});
+        let mut co = CoState::new(Stack::new(4096), |_| {});
         assert!(co.resume().is_none());
         assert!(co.resume().is_none());
     }
