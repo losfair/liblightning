@@ -200,6 +200,32 @@ mod tests {
         assert!(co.resume().is_none());
     }
 
+    #[test]
+    fn taking_stack_before_termination_should_panic() {
+        let mut co = CoState::new(Stack::new(4096), |c| {
+            let v: bool = false;
+            c.yield_now(&v);
+        });
+        assert!(co.resume().is_some());
+
+        if let Ok(_) = catch_unwind(AssertUnwindSafe(|| {
+            co.take_stack();
+        })) {
+            panic!("Taking stack of a running coroutine does not panic");
+        }
+
+        assert!(co.resume().is_none());
+    }
+
+    #[test]
+    fn taking_stack_should_work() {
+        let mut co = CoState::new(Stack::new(4096), |_| {});
+        assert!(co.resume().is_none());
+
+        assert!(co.take_stack().is_some());
+        assert!(co.take_stack().is_none());
+    }
+
     // The correct behavior for these two tests is to segfault with
     // a bad permissions error.
     /*#[test]
