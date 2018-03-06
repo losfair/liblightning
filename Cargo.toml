@@ -2,6 +2,9 @@
 name = "liblightning"
 version = "0.0.1"
 authors = ["losfair <zhy20000919@hotmail.com>"]
+description = "High-performance general-purpose stackful coroutine library."
+license = "LGPL-3.0"
+keywords = ["coroutine", "concurrent", "async", "server"]
 
 [badges]
 travis-ci = { repository = "losfair/liblightning" }
