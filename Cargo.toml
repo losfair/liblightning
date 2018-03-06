@@ -3,6 +3,9 @@ name = "liblightning"
 version = "0.1.0"
 authors = ["losfair <zhy20000919@hotmail.com>"]
 
+[badges]
+travis-ci = { repository = "losfair/liblightning" }
+
 [dependencies]
 libc = "0.2"
 lazy_static = "1.0"
