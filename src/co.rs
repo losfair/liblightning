@@ -6,7 +6,6 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 pub type StackInitializer = extern "C" fn (user_data: *mut raw::c_void);
 
-#[link(name = "lightning_platform", kind = "static")]
 extern "C" {
     fn __ll_co_yield_now(rsp_save_target: *mut usize, new_rsp: usize);
     fn __ll_init_co_stack(

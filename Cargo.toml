@@ -6,3 +6,6 @@ authors = ["losfair <zhy20000919@hotmail.com>"]
 [dependencies]
 libc = "0.2"
 lazy_static = "1.0"
+
+[build-dependencies]
+cc = "1.0"
