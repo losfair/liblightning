@@ -24,7 +24,9 @@ __ll_co_yield_now:
     popq %r12
     popq %rbp
     popq %rbx
-    ret
+
+    popq %rcx
+    jmp *%rcx
 
 .globl __ll_init_co_stack
 __ll_init_co_stack:
