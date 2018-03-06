@@ -1,5 +1,6 @@
 use stack::Stack;
 
+use std::cell::{Cell, UnsafeCell};
 use std::os::raw;
 use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -23,13 +24,114 @@ enum RunningState {
     Terminated
 }
 
+pub enum PromiseState<T: Any + 'static> {
+    Pending,
+    Resolved(T)
+}
+
+pub struct Promise<T: Any + 'static> {
+    // unsafe notes:
+    // Once the state is set to resolved, it should never
+    // be set back to pending.
+    state: UnsafeCell<PromiseState<T>>
+}
+
+pub trait CommonPromise: 'static {
+    fn is_resolved(&self) -> bool;
+    fn resolved_value(&self) -> Option<&Any>;
+}
+
+impl<T: Any + 'static> CommonPromise for Promise<T> {
+    fn is_resolved(&self) -> bool {
+        let state = unsafe { &*self.state.get() };
+        match *state {
+            PromiseState::Pending => false,
+            PromiseState::Resolved(_) => true
+        }
+    }
+
+    fn resolved_value(&self) -> Option<&Any> {
+        let state = unsafe { &*self.state.get() };
+        match *state {
+            PromiseState::Pending => None,
+            PromiseState::Resolved(ref v) => Some(v)
+        }
+    }
+}
+
+
+impl<T: Any + 'static> Promise<T> {
+    pub fn new() -> Promise<T> {
+        Promise {
+            state: UnsafeCell::new(PromiseState::Pending)
+        }
+    }
+
+    pub fn new_resolved(value: T) -> Promise<T> {
+        Promise {
+            state: UnsafeCell::new(PromiseState::Resolved(value))
+        }
+    }
+
+    pub fn resolved_value(&self) -> Option<&T> {
+        let state = unsafe { &*self.state.get() };
+        match *state {
+            PromiseState::Pending => None,
+            PromiseState::Resolved(ref v) => Some(v)
+        }
+    }
+
+    pub fn resolve(&self, value: T) {
+        unsafe {
+            let state = &mut *self.state.get();
+
+            // We should never re-set the value of a resolved promise as this may
+            // invalidate all references to the inner value.
+            if let PromiseState::Resolved(_) = *state {
+                panic!("Attempting to resolve an already resolved promise");
+            }
+
+            *self.state.get() = PromiseState::Resolved(value);
+        }
+    }
+}
+
+macro_rules! impl_instant_promise {
+    ($t:ty) => {
+        impl From<$t> for Promise<$t> {
+            fn from(other: $t) -> Promise<$t> {
+                Promise::new_resolved(other)
+            }
+        }
+    }
+}
+
+impl<T> From<Cell<T>> for Promise<Cell<T>> where T: Any + 'static {
+    fn from(other: Cell<T>) -> Promise<Cell<T>> {
+        Promise::new_resolved(other)
+    }
+}
+
+impl_instant_promise!(bool);
+impl_instant_promise!(i8);
+impl_instant_promise!(i16);
+impl_instant_promise!(i32);
+impl_instant_promise!(i64);
+impl_instant_promise!(isize);
+impl_instant_promise!(u8);
+impl_instant_promise!(u16);
+impl_instant_promise!(u32);
+impl_instant_promise!(u64);
+impl_instant_promise!(usize);
+impl_instant_promise!(String);
+
 /// The state of a coroutine.
 ///
 /// Must not be accessed by the coroutine itself.
 pub struct CoState<F: FnOnce(&mut Yieldable)> {
     _stack: Option<Stack>,
     rsp: usize,
-    yield_val: Option<*const Any>,
+    yield_val: Option<*const CommonPromise>,
     error_val: Option<Box<Any + Send>>,
     running_state: RunningState,
     f: Option<F>
@@ -39,13 +141,13 @@ pub struct CoState<F: FnOnce(&mut Yieldable)> {
 ///
 /// Only accessible from inside a coroutine.
 pub trait Yieldable {
-    fn yield_now(&mut self, val: &Any);
+    fn yield_now(&mut self, val: &CommonPromise);
 }
 
 impl<F: FnOnce(&mut Yieldable)> Yieldable for CoState<F> {
-    fn yield_now(&mut self, val: &Any) {
+    fn yield_now(&mut self, val: &CommonPromise) {
         unsafe {
-            self.yield_val = Some(val as *const Any);
+            self.yield_val = Some(val as *const CommonPromise);
 
             let new_rsp = self.rsp;
             __ll_co_yield_now(&mut self.rsp, new_rsp);
@@ -83,7 +185,7 @@ impl<F: FnOnce(&mut Yieldable)> CoState<F> {
         }
     }
 
-    pub fn resume<'a>(&'a mut self) -> Option<&'a Any> {
+    pub fn resume<'a>(&'a mut self) -> Option<&'a CommonPromise> {
         unsafe {
             let new_rsp = self.rsp;
 
@@ -151,10 +253,10 @@ mod tests {
     #[test]
     fn yield_should_work() {
         let mut co = CoState::new(Stack::new(4096), |c| {
-            c.yield_now(&42i32 as &Any);
+            c.yield_now(&Promise::from(42i32));
         });
 
-        assert!(*co.resume().unwrap().downcast_ref::<i32>().unwrap() == 42);
+        assert!(*co.resume().unwrap().resolved_value().unwrap().downcast_ref::<i32>().unwrap() == 42);
         assert!(co.resume().is_none());
     }
 
@@ -162,14 +264,14 @@ mod tests {
     fn nested_should_work() {
         let mut co = CoState::new(Stack::new(4096), |c| {
             let mut co = CoState::new(Stack::new(4096), |c| {
-                c.yield_now(&42i32 as &Any);
+                c.yield_now(&Promise::from(42i32));
             });
-            let v = *co.resume().unwrap().downcast_ref::<i32>().unwrap() + 1;
+            let v = *co.resume().unwrap().resolved_value().unwrap().downcast_ref::<i32>().unwrap() + 1;
             co.resume();
-            c.yield_now(&v as &Any);
+            c.yield_now(&Promise::from(v));
         });
 
-        assert!(*co.resume().unwrap().downcast_ref::<i32>().unwrap() == 43);
+        assert!(*co.resume().unwrap().resolved_value().unwrap().downcast_ref::<i32>().unwrap() == 43);
         assert!(co.resume().is_none());
     }
 
@@ -203,7 +305,7 @@ mod tests {
     fn taking_stack_before_termination_should_panic() {
         let mut co = CoState::new(Stack::new(4096), |c| {
             let v: bool = false;
-            c.yield_now(&v);
+            c.yield_now(&Promise::from(v));
         });
         assert!(co.resume().is_some());
 

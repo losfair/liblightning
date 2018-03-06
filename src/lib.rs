@@ -7,6 +7,6 @@ pub mod stack;
 pub mod stack_pool;
 mod platform;
 
-pub use co::CoState;
+pub use co::{CoState, Promise, CommonPromise};
 pub use stack::Stack;
 pub use stack_pool::{StackPool, StackPoolConfig};

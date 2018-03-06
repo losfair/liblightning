@@ -4,16 +4,16 @@ extern crate liblightning;
 extern crate test;
 
 use std::cell::Cell;
-use liblightning::{CoState, Stack, StackPool, StackPoolConfig};
+use liblightning::{CoState, Stack, StackPool, StackPoolConfig, Promise};
 use test::Bencher;
 
 #[bench]
 fn bench_yield(b: &mut Bencher) {
     let mut co = CoState::new(Stack::new(16384), |c| {
         loop {
-            let cont: Cell<bool> = Cell::new(true);
+            let cont: Promise<Cell<bool>> = Promise::from(Cell::new(true));
             c.yield_now(&cont);
-            if !cont.get() {
+            if !cont.resolved_value().unwrap().get() {
                 break;
             }
         }
@@ -21,7 +21,7 @@ fn bench_yield(b: &mut Bencher) {
     b.iter(|| {
         co.resume().unwrap();
     });
-    co.resume().unwrap().downcast_ref::<Cell<bool>>()
+    co.resume().unwrap().resolved_value().unwrap().downcast_ref::<Cell<bool>>()
         .unwrap()
         .set(false);
     assert!(co.resume().is_none());
