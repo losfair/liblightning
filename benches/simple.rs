@@ -4,17 +4,23 @@ extern crate liblightning;
 extern crate test;
 
 use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use liblightning::{CoState, Stack, StackPool, StackPoolConfig, Promise};
 use liblightning::co::CommonCoState;
 use test::Bencher;
 
 #[bench]
 fn bench_yield(b: &mut Bencher) {
-    let mut co = CoState::new(Stack::new(16384), |c| {
+    let flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
+
+    let flag2 = flag.clone();
+
+    let mut co = CoState::new(Stack::new(16384), move |c| {
         loop {
-            let cont: Promise<Cell<bool>> = Promise::from(Cell::new(true));
-            c.yield_now(&cont);
-            if !cont.resolved_value().unwrap().get() {
+            c.yield_now(&Promise::new_resolved());
+            if !flag2.load(Ordering::Relaxed) {
                 break;
             }
         }
@@ -22,9 +28,7 @@ fn bench_yield(b: &mut Bencher) {
     b.iter(|| {
         co.resume().unwrap();
     });
-    co.resume().unwrap().resolved_value().unwrap().downcast_ref::<Cell<bool>>()
-        .unwrap()
-        .set(false);
+    flag.store(false, Ordering::Relaxed);
     assert!(co.resume().is_none());
 }
 
