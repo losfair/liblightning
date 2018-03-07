@@ -24,114 +24,138 @@ enum RunningState {
     Terminated
 }
 
-pub enum PromiseState<T: Any + 'static> {
-    Pending,
-    Resolved(T)
+pub struct OnceInvokeBox<A1, R> {
+    inner: Box<Fn(A1) -> R>
 }
 
-pub struct Promise<T: Any + 'static> {
-    // unsafe notes:
-    // Once the state is set to resolved, it should never
-    // be set back to pending.
-    state: UnsafeCell<PromiseState<T>>
+impl<A1, R> OnceInvokeBox<A1, R> {
+    pub fn call(self, a1: A1) -> R {
+        (self.inner)(a1)
+    }
+
+    pub fn new<F: FnOnce(A1) -> R + 'static>(f: F) -> OnceInvokeBox<A1, R> {
+        let target: Cell<Option<F>> = Cell::new(Some(f));
+
+        OnceInvokeBox {
+            inner: Box::new(move |a1| {
+                (target.replace(None).unwrap())(a1)
+            })
+        }
+    }
+}
+
+pub enum PromiseState {
+    Waiting(OnceInvokeBox<OnceInvokeBox<(), ()>, ()>),
+    Pending,
+    Resolved
+}
+
+/// Promises act as an async "primitive" that does not carry data.
+pub struct Promise {
+    // TODO: change to Cell
+    state: UnsafeCell<PromiseState>
 }
 
 pub trait CommonPromise: 'static {
     fn is_resolved(&self) -> bool;
-    fn resolved_value(&self) -> Option<&Any>;
+    fn build_begin(&self) -> PromiseBegin;
 }
 
-impl<T: Any + 'static> CommonPromise for Promise<T> {
+pub struct PromiseBegin{
+    target: OnceInvokeBox<OnceInvokeBox<(), ()>, ()>
+}
+
+impl PromiseBegin {
+    pub fn run(self, cb: OnceInvokeBox<(), ()>) {
+        self.target.call(cb)
+    }
+}
+
+impl CommonPromise for Promise {
     fn is_resolved(&self) -> bool {
         let state = unsafe { &*self.state.get() };
         match *state {
-            PromiseState::Pending => false,
-            PromiseState::Resolved(_) => true
+            PromiseState::Waiting(_) | PromiseState::Pending => false,
+            PromiseState::Resolved => true
         }
     }
 
-    fn resolved_value(&self) -> Option<&Any> {
-        let state = unsafe { &*self.state.get() };
+    fn build_begin(&self) -> PromiseBegin {
+        let state = unsafe { &mut *self.state.get() };
         match *state {
-            PromiseState::Pending => None,
-            PromiseState::Resolved(ref v) => Some(v)
+            PromiseState::Waiting(_) => {},
+            _ => panic!("Attempting to call begin() on an already started promise")
+        }
+        if let PromiseState::Waiting(t) = ::std::mem::replace(state, PromiseState::Pending) {
+            PromiseBegin {
+                target: t
+            }
+        } else {
+            unreachable!()
         }
     }
 }
 
-
-impl<T: Any + 'static> Promise<T> {
-    pub fn new() -> Promise<T> {
+impl Promise {
+    pub fn new<F: FnOnce(OnceInvokeBox<(), ()>) + 'static>(f: F) -> Promise {
         Promise {
-            state: UnsafeCell::new(PromiseState::Pending)
+            state: UnsafeCell::new(PromiseState::Waiting(
+                OnceInvokeBox::new(f)
+            ))
         }
     }
 
-    pub fn new_resolved(value: T) -> Promise<T> {
+    pub fn new_resolved() -> Promise {
         Promise {
-            state: UnsafeCell::new(PromiseState::Resolved(value))
+            state: UnsafeCell::new(PromiseState::Resolved)
         }
     }
 
-    pub fn resolved_value(&self) -> Option<&T> {
-        let state = unsafe { &*self.state.get() };
-        match *state {
-            PromiseState::Pending => None,
-            PromiseState::Resolved(ref v) => Some(v)
-        }
-    }
-
-    pub fn resolve(&self, value: T) {
+    pub fn resolve(&self) {
         unsafe {
             let state = &mut *self.state.get();
 
-            // We should never re-set the value of a resolved promise as this may
-            // invalidate all references to the inner value.
-            if let PromiseState::Resolved(_) = *state {
-                panic!("Attempting to resolve an already resolved promise");
+            match *state {
+                PromiseState::Resolved => panic!("Attempting to resolve an already resolved promise"),
+                _ => {}
             }
 
-            *self.state.get() = PromiseState::Resolved(value);
+            *self.state.get() = PromiseState::Resolved;
         }
     }
-}
 
-macro_rules! impl_instant_promise {
-    ($t:ty) => {
-        impl From<$t> for Promise<$t> {
-            fn from(other: $t) -> Promise<$t> {
-                Promise::new_resolved(other)
-            }
+    /*
+    pub(crate) fn begin<F: FnOnce(T) + 'static>(&self, cb: F) {
+        let state = unsafe { &mut *self.state.get() };
+        match *state {
+            PromiseState::Waiting(_) => {},
+            _ => panic!("Attempting to call begin() on an already started promise")
         }
-    }
+        if let PromiseState::Waiting(t) = ::std::mem::replace(state, PromiseState::Pending) {
+            t.call(OnceInvokeBox::new(cb));
+        } else {
+            unreachable!()
+        }
+    }*/
 }
 
-impl<T> From<Cell<T>> for Promise<Cell<T>> where T: Any + 'static {
-    fn from(other: Cell<T>) -> Promise<Cell<T>> {
-        Promise::new_resolved(other)
-    }
+struct MaybeYieldVal {
+    val: Option<*const CommonPromise>
 }
 
-impl_instant_promise!(bool);
-impl_instant_promise!(i8);
-impl_instant_promise!(i16);
-impl_instant_promise!(i32);
-impl_instant_promise!(i64);
-impl_instant_promise!(isize);
-impl_instant_promise!(u8);
-impl_instant_promise!(u16);
-impl_instant_promise!(u32);
-impl_instant_promise!(u64);
-impl_instant_promise!(usize);
-impl_instant_promise!(String);
+unsafe impl Send for MaybeYieldVal {}
 
+pub trait CommonCoState: Send {
+    fn resume(&mut self) -> Option<&CommonPromise>;
+    fn take_stack(&mut self) -> Option<Stack>;
+}
 /// The state of a coroutine.
 ///
 /// Must not be accessed by the coroutine itself.
-pub struct CoState<F: FnOnce(&mut Yieldable)> {
+pub struct CoState<F: FnOnce(&mut Yieldable) + Send + 'static> {
     _stack: Option<Stack>,
     rsp: usize,
-    yield_val: Option<*const CommonPromise>,
+    yield_val: MaybeYieldVal,
     error_val: Option<Box<Any + Send>>,
     running_state: RunningState,
     f: Option<F>
@@ -144,10 +168,10 @@ pub trait Yieldable {
     fn yield_now(&mut self, val: &CommonPromise);
 }
 
-impl<F: FnOnce(&mut Yieldable)> Yieldable for CoState<F> {
+impl<F: FnOnce(&mut Yieldable) + Send + 'static> Yieldable for CoState<F> {
     fn yield_now(&mut self, val: &CommonPromise) {
         unsafe {
-            self.yield_val = Some(val as *const CommonPromise);
+            self.yield_val = MaybeYieldVal { val: Some(val as *const CommonPromise) };
 
             let new_rsp = self.rsp;
             __ll_co_yield_now(&mut self.rsp, new_rsp);
@@ -155,14 +179,53 @@ impl<F: FnOnce(&mut Yieldable)> Yieldable for CoState<F> {
     }
 }
 
-impl<F: FnOnce(&mut Yieldable)> CoState<F> {
+impl<F: FnOnce(&mut Yieldable) + Send + 'static> CommonCoState for CoState<F> {
+    fn resume(&mut self) -> Option<&CommonPromise> {
+        unsafe {
+            let new_rsp = self.rsp;
+
+            match self.running_state {
+                RunningState::NotStarted => {
+                    self.running_state = RunningState::Running;
+                    let rsp = &mut self.rsp as *mut usize;
+                    let self_raw = self as *mut Self as *mut raw::c_void;
+                    __ll_init_co_stack(rsp, new_rsp, Self::co_initializer, self_raw);
+
+                    if let Some(e) = self.error_val.take() {
+                        resume_unwind(e);
+                    }
+
+                    self.yield_val.val.take().map(|v| &*v)
+                },
+                RunningState::Running => {
+                    __ll_co_yield_now(&mut self.rsp, new_rsp);
+
+                    if let Some(e) = self.error_val.take() {
+                        resume_unwind(e);
+                    }
+
+                    self.yield_val.val.take().map(|v| &*v)
+                },
+                RunningState::Terminated => None
+            }
+        }
+    }
+
+    fn take_stack(&mut self) -> Option<Stack> {
+        // We can only safely take the stack of an already terminated coroutine.
+        self.ensure_terminated();
+        self._stack.take()
+    }
+}
+
+impl<F: FnOnce(&mut Yieldable) + Send + 'static> CoState<F> {
     pub fn new(stack: Stack, f: F) -> CoState<F> {
         let rsp: usize = stack.initial_rsp();
 
         CoState {
             _stack: Some(stack),
             rsp: rsp,
-            yield_val: None,
+            yield_val: MaybeYieldVal { val: None },
             error_val: None,
             running_state: RunningState::NotStarted,
             f: Some(f)
@@ -185,41 +248,10 @@ impl<F: FnOnce(&mut Yieldable)> CoState<F> {
         }
     }
 
-    pub fn resume<'a>(&'a mut self) -> Option<&'a CommonPromise> {
-        unsafe {
-            let new_rsp = self.rsp;
-
-            match self.running_state {
-                RunningState::NotStarted => {
-                    self.running_state = RunningState::Running;
-                    let rsp = &mut self.rsp as *mut usize;
-                    let self_raw = self as *mut Self as *mut raw::c_void;
-                    __ll_init_co_stack(rsp, new_rsp, Self::co_initializer, self_raw);
-
-                    if let Some(e) = self.error_val.take() {
-                        resume_unwind(e);
-                    }
-
-                    self.yield_val.take().map(|v| &*v)
-                },
-                RunningState::Running => {
-                    __ll_co_yield_now(&mut self.rsp, new_rsp);
-
-                    if let Some(e) = self.error_val.take() {
-                        resume_unwind(e);
-                    }
-
-                    self.yield_val.take().map(|v| &*v)
-                },
-                RunningState::Terminated => None
-            }
-        }
-    }
-
     unsafe fn terminate_from_inside(&mut self) -> ! {
         self.running_state = RunningState::Terminated;
 
-        self.yield_val = None;
+        self.yield_val.val = None;
 
         let new_rsp = self.rsp;
         __ll_co_yield_now(&mut self.rsp, new_rsp);
@@ -233,15 +265,9 @@ impl<F: FnOnce(&mut Yieldable)> CoState<F> {
             panic!("The current coroutine is required to be terminated at this point");
         }
     }
-
-    pub fn take_stack(&mut self) -> Option<Stack> {
-        // We can only safely take the stack of an already terminated coroutine.
-        self.ensure_terminated();
-        self._stack.take()
-    }
 }
 
-impl<F: FnOnce(&mut Yieldable)> Drop for CoState<F> {
+impl<F: FnOnce(&mut Yieldable) + Send + 'static> Drop for CoState<F> {
     fn drop(&mut self) {
         self.ensure_terminated();
     }
@@ -253,10 +279,10 @@ mod tests {
     #[test]
     fn yield_should_work() {
         let mut co = CoState::new(Stack::new(4096), |c| {
-            c.yield_now(&Promise::from(42i32));
+            c.yield_now(&Promise::new_resolved());
         });
 
-        assert!(*co.resume().unwrap().resolved_value().unwrap().downcast_ref::<i32>().unwrap() == 42);
+        assert!(co.resume().unwrap().is_resolved());
         assert!(co.resume().is_none());
     }
 
@@ -264,14 +290,14 @@ mod tests {
     fn nested_should_work() {
         let mut co = CoState::new(Stack::new(4096), |c| {
             let mut co = CoState::new(Stack::new(4096), |c| {
-                c.yield_now(&Promise::from(42i32));
+                c.yield_now(&Promise::new_resolved());
             });
-            let v = *co.resume().unwrap().resolved_value().unwrap().downcast_ref::<i32>().unwrap() + 1;
             co.resume();
-            c.yield_now(&Promise::from(v));
+            co.resume();
+            c.yield_now(&Promise::new_resolved());
         });
 
-        assert!(*co.resume().unwrap().resolved_value().unwrap().downcast_ref::<i32>().unwrap() == 43);
+        assert!(co.resume().unwrap().is_resolved());
         assert!(co.resume().is_none());
     }
 
@@ -304,8 +330,7 @@ mod tests {
     #[test]
     fn taking_stack_before_termination_should_panic() {
         let mut co = CoState::new(Stack::new(4096), |c| {
-            let v: bool = false;
-            c.yield_now(&Promise::from(v));
+            c.yield_now(&Promise::new_resolved());
         });
         assert!(co.resume().is_some());
 

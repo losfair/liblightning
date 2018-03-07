@@ -4,6 +4,8 @@ pub struct Stack {
     mem: *mut [u8]
 }
 
+unsafe impl Send for Stack {}
+
 impl Stack {
     pub fn new(stack_size: usize) -> Stack {
         // Allocate one more page as the guard page

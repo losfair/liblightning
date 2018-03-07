@@ -5,6 +5,7 @@ extern crate test;
 
 use std::cell::Cell;
 use liblightning::{CoState, Stack, StackPool, StackPoolConfig, Promise};
+use liblightning::co::CommonCoState;
 use test::Bencher;
 
 #[bench]
