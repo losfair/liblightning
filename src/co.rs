@@ -1,11 +1,9 @@
 use stack::Stack;
 
-use std::cell::{Cell, UnsafeCell};
 use std::os::raw;
 use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use promise::{Promise, PromiseBegin};
-use invoke_box::OnceInvokeBox;
+use promise::Promise;
 
 pub type StackInitializer = extern "C" fn (user_data: *mut raw::c_void);
 

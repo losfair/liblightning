@@ -1,11 +1,11 @@
 use std::time::Duration;
 use std::collections::VecDeque;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, AssertUnwindSafe, resume_unwind};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, Receiver};
 use std::any::Any;
 use std::rc::Rc;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell};
 use co::{CommonCoState, CoState, Yieldable};
 use stack_pool::{StackPool, StackPoolConfig};
 use promise::{Promise, PromiseBegin};
@@ -102,15 +102,30 @@ impl Scheduler {
         }
     }
 
-    pub fn start_promise(&mut self, p: &Promise) {
-        let begin = p.build_begin();
-        let state = self.state.clone();
+    pub fn new_default() -> Scheduler {
+        Self::new(SchedulerConfig {
+            stack_pool: StackPool::new(StackPoolConfig::default())
+        })
+    }
 
-        begin.run(OnceInvokeBox::new(move |()| {
-        }));
+    pub fn run_value_promise_to_end<T: 'static>(&mut self, vp: ValuePromise<T>) -> T {
+        let vp = Rc::new(vp);
+
+        let vp2 = vp.clone();
+        let state = self.state.clone();
+    
+        self.state.start_coroutine_raw(move |c| {
+            c.yield_now(&vp2.notify);
+            state.terminate();
+        });
+        self.run();
+
+        vp.take_value().unwrap()
     }
 
     pub fn run(&mut self) {
+        let mut sleep_micros: u64 = 0;
+
         loop {
             let termination_requested;
 
@@ -130,13 +145,27 @@ impl Scheduler {
             };
 
             let mut co = if let Some(co) = co {
+                sleep_micros = 0;
                 co
             } else {
                 if termination_requested {
+                    self.state.inner.lock().unwrap().termination_requested = false;
                     return;
                 }
-                // TODO: Latency fix
-                ::std::thread::sleep(Duration::from_millis(10));
+
+                if sleep_micros < 100 {
+                    sleep_micros += 1;
+                } else {
+                    let millis = sleep_micros / 1000;
+                    if millis > 0 {
+                        ::std::thread::sleep(Duration::from_millis(millis));
+                    }
+                    if sleep_micros < 5000 { // 5ms
+                        sleep_micros *= 2; // exponential
+                    } else if sleep_micros < 50000 { // 50ms
+                        sleep_micros += 100; // linear
+                    }
+                }
                 continue;
             };
 
@@ -200,15 +229,10 @@ mod tests {
 
     #[test]
     fn coroutines_should_be_scheduled() {
-        let mut sched = Scheduler::new(SchedulerConfig {
-            stack_pool: StackPool::new(StackPoolConfig::default())
-        });
+        let mut sched = Scheduler::new_default();
         let state = sched.state.clone();
 
-        let ret: Rc<Cell<Option<Result<(), Box<Any + Send>>>>> = Rc::new(Cell::new(None));
-        let ret2 = ret.clone();
-
-        let p = Rc::new(sched.state.run_coroutine(move |c| {
+        let vp = sched.state.run_coroutine(move |c| {
             let value: Rc<Cell<i32>> = Rc::new(Cell::new(0));
             let value2 = value.clone();
             let p = Promise::new(move |cb| {
@@ -219,26 +243,14 @@ mod tests {
             c.yield_now(&p);
             assert_eq!(value.get(), 42);
 
-            let p = state.run_coroutine(move |c| {
+            let p = state.run_coroutine(move |_| {
                 panic!("Test panic");
             });
             c.yield_now(&p.notify);
             assert_eq!(*p.value.replace(None).unwrap().err().unwrap().downcast_ref::<&'static str>().unwrap(), "Test panic");
-        }));
-
-        let p2 = p.clone();
-
-        let state = sched.state.clone();
-    
-        sched.state.start_coroutine_raw(move |c| {
-            c.yield_now(&p2.notify);
-            state.terminate();
         });
-        sched.run();
+        let ret = sched.run_value_promise_to_end(vp);
 
-        let ret = p.take_value().unwrap_or_else(|| {
-            panic!("Coroutine did not set its result");
-        });
         match ret {
             Ok(_) => {},
             Err(e) => resume_unwind(e)

@@ -14,3 +14,4 @@ pub use co::CoState;
 pub use stack::Stack;
 pub use stack_pool::{StackPool, StackPoolConfig};
 pub use promise::Promise;
+pub use scheduler::{Scheduler, SchedulerConfig};
