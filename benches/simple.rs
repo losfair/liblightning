@@ -7,7 +7,8 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use liblightning::{CoState, Stack, StackPool, StackPoolConfig, Promise};
+use std::panic::resume_unwind;
+use liblightning::{CoState, Stack, StackPool, StackPoolConfig, Promise, Scheduler};
 use liblightning::co::CommonCoState;
 use test::Bencher;
 
@@ -40,4 +41,20 @@ fn bench_run(b: &mut Bencher) {
         co.resume();
         pool.put(co.take_stack().unwrap());
     })
+}
+
+#[bench]
+fn bench_sched(b: &mut Bencher) {
+    let mut sched = Scheduler::new_default();
+    let state = sched.state.clone();
+
+    b.iter(|| {
+        let vp = sched.state.run_coroutine(move |_| {
+        });
+        let ret = sched.run_value_promise_to_end(vp);
+        match ret {
+            Ok(_) => {},
+            Err(e) => resume_unwind(e)
+        }
+    });
 }
