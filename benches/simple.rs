@@ -20,7 +20,7 @@ fn bench_yield(b: &mut Bencher) {
 
     let mut co = CoState::new(Stack::new(16384), move |c| {
         loop {
-            c.yield_now(&Promise::new_resolved());
+            c.yield_now(&Promise::new_started());
             if !flag2.load(Ordering::Relaxed) {
                 break;
             }
@@ -49,7 +49,7 @@ fn bench_sched_run(b: &mut Bencher) {
     let state = sched.get_state();
 
     b.iter(|| {
-        let vp = state.run_coroutine(move |_| {
+        let vp = state.prepare_coroutine(move |_| {
         });
         let ret = sched.run_value_promise_to_end(vp);
         match ret {
@@ -68,9 +68,9 @@ fn bench_sched_yield(b: &mut Bencher) {
         ::std::mem::transmute::<&mut Bencher, &'static mut Bencher>(b)
     };
 
-    let vp = state.run_coroutine(move |c| {
+    let vp = state.prepare_coroutine(move |c| {
         b.iter(|| {
-            let p = Promise::new_resolved();
+            let p = Promise::new_started();
             c.yield_now(&p);
         });
     });
@@ -86,10 +86,10 @@ fn bench_sched_async(b: &mut Bencher) {
         ::std::mem::transmute::<&mut Bencher, &'static mut Bencher>(b)
     };
 
-    let vp = state.run_coroutine(move |c| {
+    let vp = state.prepare_coroutine(move |c| {
         b.iter(|| {
             let p = Promise::new(|cb| {
-                cb.call(());
+                cb.notify();
             });
             c.yield_now(&p);
         });
