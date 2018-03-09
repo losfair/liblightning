@@ -1,31 +1,27 @@
 use std::time::Duration;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe, resume_unwind};
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{Sender, Receiver};
 use std::any::Any;
 use std::rc::Rc;
-use std::cell::{Cell};
+use std::cell::{Cell, RefCell};
 use co::{CommonCoState, CoState, Yieldable};
 use stack_pool::{StackPool, StackPoolConfig};
 use promise::{Promise, PromiseBegin};
 use invoke_box::OnceInvokeBox;
 
 pub struct Scheduler {
-    pub state: SharedSchedState,
-    task_feed: Receiver<Box<CommonCoState>>
+    state: SharedSchedState
 }
 
 #[derive(Clone)]
 pub struct SharedSchedState {
-    inner: Arc<Mutex<SharedSchedStateImpl>>
+    inner: Rc<RefCell<SharedSchedStateImpl>>
 }
 
 pub struct SharedSchedStateImpl {
     free_stacks: StackPool,
     termination_requested: bool,
-    running_cos: VecDeque<Box<CommonCoState>>,
-    task_sender: Sender<Box<CommonCoState>>
+    running_cos: VecDeque<Box<CommonCoState>>
 }
 
 pub struct SchedulerConfig {
@@ -54,7 +50,7 @@ impl<T: 'static> ValuePromise<T> {
 
 impl SharedSchedState {
     pub fn start_coroutine_raw<F: FnOnce(&mut Yieldable) + 'static>(&self, f: F) {
-        let mut this = self.inner.lock().unwrap();
+        let mut this = self.inner.borrow_mut();
         let stack = this.free_stacks.get();
         this.running_cos.push_back(Box::new(CoState::new(
             stack,
@@ -81,24 +77,20 @@ impl SharedSchedState {
     }
 
     pub fn terminate(&self) {
-        self.inner.lock().unwrap().termination_requested = true;
+        self.inner.borrow_mut().termination_requested = true;
     }
 }
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig) -> Scheduler {
-        let (tx, rx) = ::std::sync::mpsc::channel();
-
         Scheduler {
             state: SharedSchedState {
-                inner: Arc::new(Mutex::new(SharedSchedStateImpl {
+                inner: Rc::new(RefCell::new(SharedSchedStateImpl {
                     free_stacks: config.stack_pool,
                     termination_requested: false,
-                    running_cos: VecDeque::new(),
-                    task_sender: tx
+                    running_cos: VecDeque::new()
                 }))
-            },
-            task_feed: rx
+            }
         }
     }
 
@@ -106,6 +98,10 @@ impl Scheduler {
         Self::new(SchedulerConfig {
             stack_pool: StackPool::new(StackPoolConfig::default())
         })
+    }
+
+    pub fn get_state(&self) -> SharedSchedState {
+        self.state.clone()
     }
 
     pub fn run_value_promise_to_end<T: 'static>(&mut self, vp: ValuePromise<T>) -> T {
@@ -130,16 +126,11 @@ impl Scheduler {
             let termination_requested;
 
             let co = {
-                let mut state = self.state.inner.lock().unwrap();
+                let mut state = self.state.inner.borrow_mut();
 
                 // Scheduler should not be terminated until all coroutines has ended.
                 // Defer termination check here.
                 termination_requested = state.termination_requested;
-
-                // This should not block.
-                while let Ok(v) = self.task_feed.try_recv() {
-                    state.running_cos.push_back(v);
-                }
 
                 state.running_cos.pop_front()
             };
@@ -149,7 +140,7 @@ impl Scheduler {
                 co
             } else {
                 if termination_requested {
-                    self.state.inner.lock().unwrap().termination_requested = false;
+                    self.state.inner.borrow_mut().termination_requested = false;
                     return;
                 }
 
@@ -196,19 +187,19 @@ impl Scheduler {
                 };
                 match ps {
                     CurrentPromiseState::Resolved => {
-                        self.state.inner.lock().unwrap().running_cos.push_back(co);
+                        self.state.inner.borrow_mut().running_cos.push_back(co);
                     },
                     CurrentPromiseState::Async(begin) => {
                         let state = self.state.clone();
 
                         // NLL required for this to work
                         begin.run(OnceInvokeBox::new(move |()| {
-                            state.inner.lock().unwrap().running_cos.push_back(co);
+                            state.inner.borrow_mut().running_cos.push_back(co);
                         }));
                     },
                     CurrentPromiseState::Terminated => {
                         let stack = co.take_stack().unwrap();
-                        self.state.inner.lock().unwrap().free_stacks.put(stack);
+                        self.state.inner.borrow_mut().free_stacks.put(stack);
                     }
                 }
             })) {
