@@ -3,10 +3,11 @@ use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe, resume_unwind};
 use std::any::Any;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::cell::{Cell, RefCell};
-use co::{CommonCoState, CoState, Yieldable};
+use co::{CommonCoState, CoState, Yieldable, SendableCoState};
 use stack_pool::{StackPool, StackPoolConfig};
-use promise::{Promise, PromiseBegin};
+use promise::{Promise, PromiseBegin, NotifyHandle};
 use invoke_box::OnceInvokeBox;
 
 pub struct Scheduler {
@@ -21,7 +22,17 @@ pub struct SharedSchedState {
 pub struct SharedSchedStateImpl {
     free_stacks: StackPool,
     termination_requested: bool,
-    running_cos: VecDeque<Box<CommonCoState>>
+    running_cos: VecDeque<Box<CommonCoState>>,
+    sync_state: SyncSchedState
+}
+
+#[derive(Clone)]
+pub struct SyncSchedState {
+    inner: Arc<Mutex<SyncSchedStateImpl>>
+}
+
+pub struct SyncSchedStateImpl {
+    pending_cos: Vec<Box<CommonCoState>>
 }
 
 pub struct SchedulerConfig {
@@ -29,27 +40,36 @@ pub struct SchedulerConfig {
 }
 
 pub struct ValuePromise<T: 'static> {
-    notify: Promise,
-    value: Rc<Cell<Option<T>>>
+    pub notify: Promise,
+    pub value: Rc<Cell<Option<T>>>
 }
 
 impl<T: 'static> ValuePromise<T> {
     pub fn take_value(&self) -> Option<T> {
         self.value.replace(None)
     }
+}
 
-    pub fn is_resolved(&self) -> bool {
-        self.notify.is_resolved()
-    }
+unsafe impl Send for SyncSchedStateImpl {}
 
-    pub fn resolve(&self, v: T) {
-        self.value.replace(Some(v));
-        self.notify.resolve();
+impl SyncSchedState {
+    // This is unsafe because we cannot check whether the coroutine originally
+    // belongs to the sched state.
+    pub(crate) unsafe fn add_coroutine(&self, co: SendableCoState) {
+        self.inner.lock().unwrap().pending_cos.push(co.unwrap());
     }
 }
 
 impl SharedSchedState {
-    pub fn start_coroutine_raw<F: FnOnce(&mut Yieldable) + 'static>(&self, f: F) {
+    pub fn get_sync(&self) -> SyncSchedState {
+        self.inner.borrow().sync_state.clone()
+    }
+
+    pub(crate) fn push_coroutine_raw(&self, co: Box<CommonCoState>) {
+        self.inner.borrow_mut().running_cos.push_back(co);
+    }
+
+    pub fn start_coroutine<F: FnOnce(&mut Yieldable) + 'static>(&self, f: F) {
         let mut this = self.inner.borrow_mut();
         let stack = this.free_stacks.get();
         this.running_cos.push_back(Box::new(CoState::new(
@@ -58,7 +78,7 @@ impl SharedSchedState {
         )));
     }
 
-    pub fn run_coroutine<R: 'static, F: FnOnce(&mut Yieldable) -> R + 'static>(&self, f: F) -> ValuePromise<Result<R, Box<Any + Send>>> {
+    pub fn prepare_coroutine<R: 'static, F: FnOnce(&mut Yieldable) -> R + 'static>(&self, f: F) -> ValuePromise<Result<R, Box<Any + Send>>> {
         let value: Rc<Cell<Option<Result<R, Box<Any + Send>>>>> = Rc::new(Cell::new(None));
         let value2 = value.clone();
 
@@ -66,9 +86,9 @@ impl SharedSchedState {
     
         let vp: ValuePromise<Result<R, Box<Any + Send>>> = ValuePromise {
             notify: Promise::new(move |cb| {
-                this.start_coroutine_raw(move |c| {
+                this.start_coroutine(move |c| {
                     value2.set(Some(catch_unwind(AssertUnwindSafe(move || f(c)))));
-                    cb.call(());
+                    cb.notify();
                 })
             }),
             value: value
@@ -88,7 +108,12 @@ impl Scheduler {
                 inner: Rc::new(RefCell::new(SharedSchedStateImpl {
                     free_stacks: config.stack_pool,
                     termination_requested: false,
-                    running_cos: VecDeque::new()
+                    running_cos: VecDeque::new(),
+                    sync_state: SyncSchedState {
+                        inner: Arc::new(Mutex::new(SyncSchedStateImpl {
+                            pending_cos: Vec::new()
+                        }))
+                    }
                 }))
             }
         }
@@ -110,7 +135,7 @@ impl Scheduler {
         let vp2 = vp.clone();
         let state = self.state.clone();
     
-        self.state.start_coroutine_raw(move |c| {
+        self.state.start_coroutine(move |c| {
             c.yield_now(&vp2.notify);
             state.terminate();
         });
@@ -121,8 +146,23 @@ impl Scheduler {
 
     pub fn run(&mut self) {
         let mut sleep_micros: u64 = 0;
+        let mut run_count: usize = 0;
 
         loop {
+            run_count += 1;
+            if run_count == 60 {
+                run_count = 0;
+            }
+
+            if run_count == 0 {
+                let mut state = self.state.inner.borrow_mut();
+                let pending = ::std::mem::replace(
+                    &mut state.sync_state.inner.lock().unwrap().pending_cos,
+                    Vec::new()
+                );
+                state.running_cos.extend(pending.into_iter());
+            }
+
             let termination_requested;
 
             let co = {
@@ -162,7 +202,7 @@ impl Scheduler {
 
             // Workaround for borrowck issues. Should be removed once NLL lands in stable Rust.
             enum CurrentPromiseState {
-                Resolved,
+                Started,
                 Async(PromiseBegin),
                 Terminated
             }
@@ -175,8 +215,8 @@ impl Scheduler {
                     // Promise.
                     if let Some(p) = ret {
                         // This promise contains an instant value.
-                        if p.is_resolved() {
-                            CurrentPromiseState::Resolved
+                        if p.is_started() {
+                            CurrentPromiseState::Started
                         } else { // Some async operations required.
                             CurrentPromiseState::Async(p.build_begin())
                         }
@@ -186,16 +226,12 @@ impl Scheduler {
                     }
                 };
                 match ps {
-                    CurrentPromiseState::Resolved => {
+                    CurrentPromiseState::Started => {
                         self.state.inner.borrow_mut().running_cos.push_back(co);
                     },
                     CurrentPromiseState::Async(begin) => {
                         let state = self.state.clone();
-
-                        // NLL required for this to work
-                        begin.run(OnceInvokeBox::new(move |()| {
-                            state.inner.borrow_mut().running_cos.push_back(co);
-                        }));
+                        begin.run(NotifyHandle::new(state, co));
                     },
                     CurrentPromiseState::Terminated => {
                         let stack = co.take_stack().unwrap();
@@ -223,18 +259,18 @@ mod tests {
         let mut sched = Scheduler::new_default();
         let state = sched.state.clone();
 
-        let vp = sched.state.run_coroutine(move |c| {
+        let vp = sched.state.prepare_coroutine(move |c| {
             let value: Rc<Cell<i32>> = Rc::new(Cell::new(0));
             let value2 = value.clone();
             let p = Promise::new(move |cb| {
                 value2.set(42);
-                cb.call(());
+                cb.notify();
             });
             assert_eq!(value.get(), 0);
             c.yield_now(&p);
             assert_eq!(value.get(), 42);
 
-            let p = state.run_coroutine(move |_| {
+            let p = state.prepare_coroutine(move |_| {
                 panic!("Test panic");
             });
             c.yield_now(&p.notify);

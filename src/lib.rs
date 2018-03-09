@@ -10,7 +10,7 @@ pub mod promise;
 mod invoke_box;
 mod platform;
 
-pub use co::CoState;
+pub use co::{CoState, Yieldable};
 pub use stack::Stack;
 pub use stack_pool::{StackPool, StackPoolConfig};
 pub use promise::Promise;

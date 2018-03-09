@@ -46,6 +46,25 @@ pub struct CoState<F: FnOnce(&mut Yieldable) + 'static> {
     f: Option<F>
 }
 
+/// Used for returning from a promise execution on another thread.
+pub(crate) struct SendableCoState {
+    inner: Box<CommonCoState>
+}
+
+unsafe impl Send for SendableCoState {}
+
+impl SendableCoState {
+    pub fn new(inner: Box<CommonCoState>) -> SendableCoState {
+        SendableCoState {
+            inner: inner
+        }
+    }
+
+    pub unsafe fn unwrap(self) -> Box<CommonCoState> {
+        self.inner
+    }
+}
+
 /// A coroutine's view of itself.
 ///
 /// Only accessible from inside a coroutine.
@@ -164,10 +183,10 @@ mod tests {
     #[test]
     fn yield_should_work() {
         let mut co = CoState::new(Stack::new(4096), |c| {
-            c.yield_now(&Promise::new_resolved());
+            c.yield_now(&Promise::new_started());
         });
 
-        assert!(co.resume().unwrap().is_resolved());
+        assert!(co.resume().is_some());
         assert!(co.resume().is_none());
     }
 
@@ -175,14 +194,14 @@ mod tests {
     fn nested_should_work() {
         let mut co = CoState::new(Stack::new(4096), |c| {
             let mut co = CoState::new(Stack::new(4096), |c| {
-                c.yield_now(&Promise::new_resolved());
+                c.yield_now(&Promise::new_started());
             });
             co.resume();
             co.resume();
-            c.yield_now(&Promise::new_resolved());
+            c.yield_now(&Promise::new_started());
         });
 
-        assert!(co.resume().unwrap().is_resolved());
+        assert!(co.resume().is_some());
         assert!(co.resume().is_none());
     }
 
@@ -215,7 +234,7 @@ mod tests {
     #[test]
     fn taking_stack_before_termination_should_panic() {
         let mut co = CoState::new(Stack::new(4096), |c| {
-            c.yield_now(&Promise::new_resolved());
+            c.yield_now(&Promise::new_started());
         });
         assert!(co.resume().is_some());
 
