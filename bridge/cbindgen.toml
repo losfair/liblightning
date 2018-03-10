@@ -1,0 +1,4 @@
+namespace = "liblightning"
+
+[parse]
+parse_deps = true
