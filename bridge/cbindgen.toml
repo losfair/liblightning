@@ -1,4 +1,5 @@
 namespace = "liblightning"
+include_guard = "_LIBLIGHTNING_BRIDGE_H_"
 
 [parse]
 parse_deps = true
