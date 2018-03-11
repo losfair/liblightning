@@ -30,7 +30,7 @@ class CoroutineEntry(llbridge.CoroutineEntryCallback):
         super().__init__()
 
     def call(self):
-        print("Hello")
+        pass
 
 sched = llbridge.ll_scheduler_new()
 entry = CoroutineEntry()
