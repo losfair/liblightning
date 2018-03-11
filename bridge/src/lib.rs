@@ -2,7 +2,7 @@ extern crate liblightning;
 
 use std::cell::RefCell;
 use std::os::raw::c_void;
-use liblightning::{Scheduler, Yieldable, Promise};
+use liblightning::{Scheduler, Yieldable, Promise, SchedulerConfig, StackPool, StackPoolConfig};
 use liblightning::scheduler::SharedSchedState;
 use liblightning::promise::{NotifyHandle, SendableNotifyHandle};
 
@@ -40,6 +40,16 @@ pub extern "C" fn ll_scheduler_new() -> *mut Scheduler {
 }
 
 #[no_mangle]
+pub extern "C" fn ll_scheduler_new_with_config(stack_size: usize, max_pool_size: usize) -> *mut Scheduler {
+    Box::into_raw(Box::new(Scheduler::new(SchedulerConfig {
+        stack_pool: StackPool::new(StackPoolConfig {
+            default_stack_size: stack_size,
+            max_pool_size: max_pool_size
+        })
+    })))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ll_scheduler_destroy(sch: *mut Scheduler) {
     Box::from_raw(sch);
 }
@@ -52,6 +62,11 @@ pub extern "C" fn ll_scheduler_get_state(sch: &mut Scheduler) -> *mut SharedSche
 #[no_mangle]
 pub extern "C" fn ll_scheduler_run(sch: &mut Scheduler) {
     sch.run();
+}
+
+#[no_mangle]
+pub extern "C" fn ll_scheduler_run_once(sch: &mut Scheduler, max_run_count: usize) -> usize {
+    sch.run_once(max_run_count)
 }
 
 #[no_mangle]
@@ -74,6 +89,14 @@ pub unsafe extern "C" fn ll_shared_state_destroy(
     s: *mut SharedSchedState
 ) {
     Box::from_raw(s);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ll_current_stack_end() -> *mut u8 {
+    YIELD_INFO.with(|info| {
+        let info = info.borrow();
+        (&*info[info.len() - 1]).stack_end()
+    })
 }
 
 #[no_mangle]

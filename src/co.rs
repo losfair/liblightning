@@ -38,7 +38,7 @@ pub trait CommonCoState {
 ///
 /// Must not be accessed by the coroutine itself.
 pub struct CoState<F: FnOnce(&mut Yieldable) + 'static> {
-    _stack: Option<Stack>,
+    stack: Option<Stack>,
     rsp: usize,
     yield_val: MaybeYieldVal,
     error_val: Option<Box<Any + Send>>,
@@ -70,6 +70,8 @@ impl SendableCoState {
 /// Only accessible from inside a coroutine.
 pub trait Yieldable {
     fn yield_now(&mut self, val: &Promise);
+    fn stack_begin(&self) -> *mut u8;
+    fn stack_end(&self) -> *mut u8;
 }
 
 impl<F: FnOnce(&mut Yieldable) + 'static> Yieldable for CoState<F> {
@@ -79,6 +81,22 @@ impl<F: FnOnce(&mut Yieldable) + 'static> Yieldable for CoState<F> {
 
             let new_rsp = self.rsp;
             __ll_co_yield_now(&mut self.rsp, new_rsp);
+        }
+    }
+
+    fn stack_begin(&self) -> *mut u8 {
+        unsafe {
+            let stack = self.stack.as_ref().unwrap();
+            let mem = &mut *stack.get_mem();
+            (&mut mem[0] as *mut u8).offset(mem.len() as isize)
+        }
+    }
+
+    fn stack_end(&self) -> *mut u8 {
+        unsafe {
+            let stack = self.stack.as_ref().unwrap();
+            let mem = &mut *stack.get_mem();
+            &mut mem[0] as *mut u8
         }
     }
 }
@@ -118,7 +136,7 @@ impl<F: FnOnce(&mut Yieldable) + 'static> CommonCoState for CoState<F> {
     fn take_stack(&mut self) -> Option<Stack> {
         // We can only safely take the stack of an already terminated coroutine.
         self.ensure_terminated();
-        self._stack.take()
+        self.stack.take()
     }
 }
 
@@ -127,7 +145,7 @@ impl<F: FnOnce(&mut Yieldable) + 'static> CoState<F> {
         let rsp: usize = stack.initial_rsp();
 
         CoState {
-            _stack: Some(stack),
+            stack: Some(stack),
             rsp: rsp,
             yield_val: MaybeYieldVal { val: None },
             error_val: None,

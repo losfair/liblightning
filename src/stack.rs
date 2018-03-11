@@ -22,6 +22,10 @@ impl Stack {
         let mem = unsafe { &mut *self.mem };
         &mut mem[0] as *mut u8 as usize + mem.len()
     }
+
+    pub fn get_mem(&self) -> *mut [u8] {
+        self.mem
+    }
 }
 
 impl Drop for Stack {

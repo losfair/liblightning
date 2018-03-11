@@ -144,6 +144,65 @@ impl Scheduler {
         vp.take_value().unwrap()
     }
 
+    pub fn run_once(&mut self, max_run_count: usize) -> usize {
+        let mut run_count: usize = 0;
+
+        // Workaround for borrowck issues. Should be removed once NLL lands in stable Rust.
+        enum CurrentPromiseState {
+            Started,
+            Async(PromiseBegin),
+            Terminated
+        }
+
+        while let Some(mut co) = {
+            let mut state = self.state.inner.borrow_mut();
+            state.running_cos.pop_front()
+        } {
+            if let Err(_) = catch_unwind(AssertUnwindSafe(|| {
+                let ps = {
+                    let ret = co.resume();
+
+                    // Promise.
+                    if let Some(p) = ret {
+                        // This promise contains an instant value.
+                        if p.is_started() {
+                            CurrentPromiseState::Started
+                        } else { // Some async operations required.
+                            CurrentPromiseState::Async(p.build_begin())
+                        }
+                    } else {
+                        // The current coroutine is terminated
+                        CurrentPromiseState::Terminated
+                    }
+                };
+                match ps {
+                    CurrentPromiseState::Started => {
+                        self.state.inner.borrow_mut().running_cos.push_back(co);
+                    },
+                    CurrentPromiseState::Async(begin) => {
+                        let state = self.state.clone();
+                        begin.run(NotifyHandle::new(state, co));
+                    },
+                    CurrentPromiseState::Terminated => {
+                        let stack = co.take_stack().unwrap();
+                        self.state.inner.borrow_mut().free_stacks.put(stack);
+                    }
+                }
+            })) {
+                eprintln!("Error in coroutine");
+            }
+
+            run_count += 1;
+
+            // We will never enter this branch if max_run_count is zero.
+            if run_count == max_run_count {
+                break;
+            }
+        }
+
+        run_count
+    }
+
     pub fn run(&mut self) {
         let mut sleep_micros: u64 = 0;
         let mut run_count: usize = 0;
